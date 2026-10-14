@@ -55,6 +55,20 @@ var accessTokenExemptRoutes = []string{
 	"POST /api/user/auth/refresh",
 	"POST /api/user/auth/logout",
 
+	// Desktop credentials have their own authentication; only auth/complete uses UserAuth.
+	"POST /api/link/v1/auth/start",
+	"POST /api/link/v1/auth/exchange",
+	"POST /api/link/v1/auth/refresh",
+	"POST /api/link/v1/auth/logout",
+	"GET /api/link/v1/bootstrap",
+	"GET /api/link/v1/catalog",
+	"POST /api/link/v1/connections",
+	"GET /api/link/v1/connections/:id",
+	"POST /api/link/v1/connections/:id/actions",
+	"GET /api/link/v1/operations/:id",
+	"POST /api/link/v1/connections/:id/tool-verifications",
+	"GET /api/link/v1/tool-verifications/:id",
+
 	// Payment callbacks.
 	"POST /api/stripe/webhook",
 	"POST /api/creem/webhook",

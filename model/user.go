@@ -1233,10 +1233,14 @@ func ValidateAccessToken(token string) (*User, error) {
 	if token == "" {
 		return nil, nil
 	}
+	token = strings.Replace(token, "Bearer ", "", 1)
+	// Client credentials never fall through to legacy dashboard PAT lookup.
+	if IsLinkCredential(token) {
+		return nil, nil
+	}
 	if LegacyAccessTokensRetired(common.GetTimestamp()) {
 		return nil, ErrLegacyAccessTokenRetired
 	}
-	token = strings.Replace(token, "Bearer ", "", 1)
 	user := &User{}
 	err := DB.Where("access_token = ?", token).First(user).Error
 	if err != nil {

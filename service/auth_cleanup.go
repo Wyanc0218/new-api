@@ -48,6 +48,12 @@ func cleanupAuthArtifacts() {
 	if err := model.DeleteExpiredAuthFlows(now); err != nil {
 		common.SysError(common.LogText("failed to delete expired authentication flows: %s", err.Error()))
 	}
+	if err := model.DeleteExpiredLinkSessions(now.Unix()); err != nil {
+		common.SysError(common.LogText("failed to delete expired client sessions: %s", err.Error()))
+	}
+	if err := model.DeleteExpiredLinkToolVerifications(now.Unix()); err != nil {
+		common.SysError(common.LogText("failed to delete expired tool verification receipts"))
+	}
 	accessTokenExpiredBefore := now.Unix() - int64(common.UserSessionRevokedRetentionDays)*24*60*60
 	if err := model.DeleteExpiredUserAccessTokens(accessTokenExpiredBefore); err != nil {
 		common.SysError(common.LogText("failed to delete expired access tokens: %s", err.Error()))

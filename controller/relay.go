@@ -67,6 +67,9 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	verificationChallenge := c.GetHeader(service.LinkVerificationHeader)
+	// Verification is internal metadata, never an upstream provider header.
+	c.Request.Header.Del(service.LinkVerificationHeader)
 
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -123,6 +126,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
+	}
+	verificationID := ""
+	verificationCompleted := false
+	if verificationChallenge != "" {
+		verificationID, err = service.ClaimLinkRelayVerification(c, relayInfo, verificationChallenge)
+		if err != nil {
+			newAPIError = types.NewErrorWithStatusCode(model.ErrLinkVerification, types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry())
+			return
+		}
+		defer func() {
+			service.FinishLinkRelayVerification(c, relayInfo, verificationID, verificationCompleted && newAPIError == nil)
+		}()
 	}
 
 	defer func() {
@@ -198,6 +213,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
+			verificationCompleted = true
 			relayInfo.LastError = nil
 			return
 		}

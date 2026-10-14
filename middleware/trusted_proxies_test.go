@@ -125,3 +125,42 @@ func TestConfigureTrustedProxiesRejectsInvalidConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestLinkTransportUsesExplicitTrustedProxyConfiguration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name, proxies, peer, target string
+		forwarded                   []string
+		status                      int
+	}{
+		{"direct TLS", "none", "198.51.100.2:1234", "https://platform.example/", nil, http.StatusNoContent},
+		{"local development", "none", "127.0.0.1:1234", "http://127.0.0.1:3000/", nil, http.StatusNoContent},
+		{"default loopback proxy", "", "127.0.0.1:1234", "http://platform.example/", []string{"https"}, http.StatusNoContent},
+		{"private peer needs explicit trust", "", "172.20.0.2:1234", "http://platform.example/", []string{"https"}, http.StatusBadRequest},
+		{"container proxy CIDR", "172.20.0.0/24", "172.20.0.2:1234", "http://platform.example/", []string{"https"}, http.StatusNoContent},
+		{"exact IPv6 proxy", "fd12:3456::2", "[fd12:3456::2]:1234", "http://platform.example/", []string{"https"}, http.StatusNoContent},
+		{"untrusted peer cannot spoof TLS", "172.20.0.0/24", "198.51.100.2:1234", "http://platform.example/", []string{"https"}, http.StatusBadRequest},
+		{"none also disables loopback forwarding", "none", "127.0.0.1:1234", "http://platform.example/", []string{"https"}, http.StatusBadRequest},
+		{"explicit list replaces loopback default", "172.20.0.0/24", "127.0.0.1:1234", "http://platform.example/", []string{"https"}, http.StatusBadRequest},
+		{"missing TLS header", "172.20.0.0/24", "172.20.0.2:1234", "http://platform.example/", nil, http.StatusBadRequest},
+		{"HTTP is not TLS", "172.20.0.0/24", "172.20.0.2:1234", "http://platform.example/", []string{"http"}, http.StatusBadRequest},
+		{"duplicate headers are ambiguous", "172.20.0.0/24", "172.20.0.2:1234", "http://platform.example/", []string{"https", "http"}, http.StatusBadRequest},
+		{"comma joined headers are ambiguous", "172.20.0.0/24", "172.20.0.2:1234", "http://platform.example/", []string{"https,http"}, http.StatusBadRequest},
+		{"invalid configuration fails closed", "172.20.0.0/24,invalid", "172.20.0.2:1234", "http://platform.example/", []string{"https"}, http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TRUSTED_PROXIES", test.proxies)
+			router := gin.New()
+			router.Use(LinkTransport())
+			router.GET("/", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			request := httptest.NewRequest(http.MethodGet, test.target, nil)
+			request.RemoteAddr = test.peer
+			request.Header["X-Forwarded-Proto"] = test.forwarded
+			request.Header.Set("X-Forwarded-For", "127.0.0.1")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, test.status, response.Code)
+		})
+	}
+}

@@ -278,6 +278,10 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+	// Management credentials are never inference keys.
+	if IsLinkCredential(key) {
+		return nil, gorm.ErrRecordNotFound
+	}
 	if !fromDB && common.RedisEnabled {
 		// Try Redis first
 		token, err := cacheGetTokenByKey(key)

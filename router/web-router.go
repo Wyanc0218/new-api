@@ -40,7 +40,9 @@ func SetWebRouter(router *gin.Engine, assets WebAssets, pluginDispatcher gin.Han
 				controller.RelayNotFound(c)
 				return
 			}
-			c.Header("Cache-Control", "no-cache")
+			if c.Writer.Header().Get("Cache-Control") != "no-store" {
+				c.Header("Cache-Control", "no-cache")
+			}
 			c.Data(http.StatusOK, "text/html; charset=utf-8", assets.IndexPage)
 		},
 	)

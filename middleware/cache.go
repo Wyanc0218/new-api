@@ -6,6 +6,10 @@ import (
 
 func Cache() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if c.Writer.Header().Get("Cache-Control") == "no-store" {
+			c.Next()
+			return
+		}
 		if c.Request.RequestURI == "/" {
 			c.Header("Cache-Control", "no-cache")
 		} else {
