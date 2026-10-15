@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -219,6 +221,9 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 	if !IsUserSelectableGroup(user.Group, group) {
 		return nil, model.LinkFailure(403, "LINK_FORBIDDEN", "Price group is not available to this account")
 	}
+	if tool == "workbuddy" {
+		return linkWorkBuddyCatalog(tx, user, group)
+	}
 	file, err := os.Open(os.Getenv("LINK_MODEL_CATALOG_FILE"))
 	if err != nil {
 		return nil, model.LinkFailure(503, "LINK_CATALOG_UNAVAILABLE", "Verified model catalog is unavailable")
@@ -282,6 +287,127 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 		Tool, Group string
 		Models      []LinkCatalogEntry
 	}{string(raw), tool, group, result.Models})
+	sum := sha256.Sum256(material)
+	result.Revision = hex.EncodeToString(sum[:])
+	return result, nil
+}
+
+// WorkBuddy accepts custom OpenAI chat models. Its availability must follow the
+// platform's live routes, not a second, manually maintained model allowlist.
+func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCatalog, error) {
+	var abilities []model.Ability
+	if err := tx.Where(&model.Ability{Group: group, Enabled: true}).Find(&abilities).Error; err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int, 0, len(abilities))
+	seenChannels := make(map[int]bool)
+	for _, ability := range abilities {
+		if !seenChannels[ability.ChannelId] {
+			channelIDs = append(channelIDs, ability.ChannelId)
+			seenChannels[ability.ChannelId] = true
+		}
+	}
+	var channels []model.Channel
+	if len(channelIDs) > 0 {
+		// Do not load upstream credentials or use GetOtherSettings, whose invalid
+		// JSON recovery can write the channel outside this transaction.
+		if err := tx.Select("id", "type", "settings").Where("id IN ? AND status = ?", channelIDs, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+	}
+	byID := make(map[int]model.Channel, len(channels))
+	for _, channel := range channels {
+		byID[channel.Id] = channel
+	}
+	available := make(map[string]bool)
+	for _, ability := range abilities {
+		channel, enabled := byID[ability.ChannelId]
+		if !enabled || ability.Model == "" || len(ability.Model) > 255 {
+			continue
+		}
+		endpoints := common.GetEndpointTypesByChannelType(channel.Type, ability.Model)
+		if channel.Type == constant.ChannelTypeAdvancedCustom {
+			var settings dto.ChannelOtherSettings
+			if common.UnmarshalJsonStr(channel.OtherSettings, &settings) != nil || settings.AdvancedCustom == nil {
+				continue
+			}
+			endpoints = settings.AdvancedCustom.SupportedEndpointTypesForModel(ability.Model)
+		} else {
+			// Generic OpenAI channel capabilities include chat even for known
+			// non-chat models. Follow the platform's image classification and
+			// controller/channel-test.go task detection. Explicit custom routes
+			// above remain authoritative; unfamiliar aliases are not guessed.
+			name := strings.ToLower(ability.Model)
+			if common.IsImageGenerationModel(name) || strings.Contains(name, "rerank") || strings.Contains(name, "embed") || strings.HasPrefix(name, "m3e") || strings.Contains(name, "bge-") || channel.Type == constant.ChannelTypeMokaAI {
+				continue
+			}
+		}
+		if slices.Contains(endpoints, constant.EndpointTypeOpenAI) {
+			available[ability.Model] = true
+		}
+	}
+	if len(available) == 0 {
+		return nil, model.LinkFailure(409, "LINK_NO_MODELS", "No chat completion model is currently available in this price group")
+	}
+
+	// An optional compatibility file enriches capabilities only. Missing, invalid
+	// or conflicting optional metadata must not hide otherwise available models.
+	metadata := make(map[string]map[string]any)
+	if file, err := os.Open(os.Getenv("LINK_MODEL_CATALOG_FILE")); err == nil {
+		defer file.Close()
+		raw, readErr := io.ReadAll(io.LimitReader(file, 1024*1024+1))
+		var configured struct {
+			Models []LinkCatalogEntry `json:"models"`
+		}
+		if readErr == nil && len(raw) <= 1024*1024 && common.Unmarshal(raw, &configured) == nil {
+			seen := make(map[string]bool)
+			for _, entry := range configured.Models {
+				if !available[entry.ID] || !slices.Contains(entry.ToolFamilies, "workbuddy") || !slices.Contains(entry.Groups, group) {
+					continue
+				}
+				if seen[entry.ID] {
+					delete(metadata, entry.ID)
+					continue
+				}
+				seen[entry.ID] = true
+				if entry.Protocol != "openai_chat_completions" {
+					continue
+				}
+				capabilities, ok := entry.Metadata["workbuddy"].(map[string]any)
+				if !ok {
+					continue
+				}
+				verified := make(map[string]any)
+				for _, key := range []string{"supportsToolCall", "supportsImages", "supportsReasoning"} {
+					if value, ok := capabilities[key].(bool); ok {
+						verified[key] = value
+					}
+				}
+				for _, key := range []string{"maxInputTokens", "maxOutputTokens"} {
+					if value, ok := capabilities[key].(float64); ok && value > 0 && value <= 9007199254740991 && math.Trunc(value) == value {
+						verified[key] = value
+					}
+				}
+				if len(verified) > 0 {
+					metadata[entry.ID] = verified
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(available))
+	for name := range available {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	result := &LinkCatalog{ToolFamily: "workbuddy", Group: group, Models: []LinkCatalogEntry{}, DefaultModel: names[0]}
+	for _, name := range names {
+		entry := LinkCatalogEntry{ID: name, Label: name, Protocol: "openai_chat_completions", Metadata: map[string]any{}, PriceText: linkModelPriceText(user.Group, group, name)}
+		if capabilities := metadata[name]; capabilities != nil {
+			entry.Metadata["workbuddy"] = capabilities
+		}
+		result.Models = append(result.Models, entry)
+	}
+	material, _ := common.Marshal(result)
 	sum := sha256.Sum256(material)
 	result.Revision = hex.EncodeToString(sum[:])
 	return result, nil

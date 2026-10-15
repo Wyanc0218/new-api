@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
@@ -136,7 +137,7 @@ func linkAction(t *testing.T, client *linkTestClient, conn map[string]any, actio
 	return client.request("POST", "/connections/"+conn["id"].(string)+"/actions", r, 200)
 }
 
-func testLinkLivePrices(t *testing.T, db *gorm.DB, user *model.User, client *linkTestClient, catalogPath string) {
+func testLinkLivePrices(t *testing.T, db *gorm.DB, user *model.User, client *linkTestClient, catalogPath string, channelID int) {
 	t.Helper()
 	priorCatalog, err := os.ReadFile(catalogPath)
 	require.NoError(t, err)
@@ -166,8 +167,11 @@ func testLinkLivePrices(t *testing.T, db *gorm.DB, user *model.User, client *lin
 		require.NoError(t, db.Model(&model.User{}).Where("id = ?", user.Id).Update("group", user.Group).Error)
 	})
 	modelNames := []string{"link-price-model", "claude-link-price-model"}
+	t.Cleanup(func() {
+		require.NoError(t, db.Where("channel_id = ? AND model IN ?", channelID, modelNames).Delete(&model.Ability{}).Error)
+	})
 	for _, id := range modelNames {
-		require.NoError(t, db.Create(&model.Ability{Group: "vip", Model: id, ChannelId: user.Id, Enabled: true}).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: "vip", Model: id, ChannelId: channelID, Enabled: true}).Error)
 	}
 	const suffix = "；已含当前账号及所选组倍率，工具等附加费用另计，以请求时平台结算为准"
 	const normal = "文本基础价（美元/百万令牌）：输入 6，输出 18，缓存读取 0.6，缓存写入 7.5" + suffix
@@ -322,8 +326,98 @@ func testLinkAuthorizationGuards(t *testing.T, db *gorm.DB, router *gin.Engine, 
 	}
 }
 
+func testLinkWorkBuddyLiveCatalog(t *testing.T, db *gorm.DB, client *linkTestClient) {
+	t.Helper()
+	t.Setenv("LINK_MODEL_CATALOG_FILE", "")
+	baseline := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	require.Len(t, baseline.Data["models"], 2)
+	assert.Empty(t, baseline.Data["models"].([]any)[0].(map[string]any)["metadata"])
+	client.request("GET", "/catalog?tool_family=workbuddy&group=not-authorized", nil, 403)
+
+	customSettings := `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat","models":["custom-chat"]},{"incoming_path":"/v1/responses","upstream_path":"/responses","models":["custom-response"]}]}}`
+	cases := []struct {
+		name, group, settings string
+		channelType, status   int
+		enabled               bool
+	}{
+		{"glm-5.2", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true},
+		{"opaque-alias", "default", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true},
+		{"dall-e-3", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true},
+		{"text-embedding-3-large", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true},
+		{"rerank-v3.5", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true},
+		{"group-isolated", "default", "", constant.ChannelTypeCodex, common.ChannelStatusEnabled, true},
+		{"group-isolated", "vip", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true},
+		{"disabled-channel", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusManuallyDisabled, true},
+		{"disabled-ability", "default", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false},
+		{"custom-chat", "default", customSettings, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true},
+		{"chat-about-embeddings", "default", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat","models":["chat-about-embeddings"]}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true},
+		{"custom-response", "default", customSettings, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true},
+		{"invalid-settings", "default", "invalid-json", constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true},
+	}
+	channelIDs := make([]int, 0, len(cases))
+	t.Cleanup(func() {
+		require.NoError(t, db.Where("channel_id IN ?", channelIDs).Delete(&model.Ability{}).Error)
+		require.NoError(t, db.Where("id IN ?", channelIDs).Delete(&model.Channel{}).Error)
+	})
+	for _, tc := range cases {
+		channel := model.Channel{Type: tc.channelType, Status: tc.status, Name: tc.name, Key: "unused", OtherSettings: tc.settings}
+		require.NoError(t, db.Create(&channel).Error)
+		channelIDs = append(channelIDs, channel.Id)
+		require.NoError(t, db.Create(&model.Ability{Group: tc.group, Model: tc.name, ChannelId: channel.Id, Enabled: tc.enabled}).Error)
+	}
+	catalog := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	var names []string
+	for _, item := range catalog.Data["models"].([]any) {
+		entry := item.(map[string]any)
+		names = append(names, entry["id"].(string))
+		assert.Equal(t, "openai_chat_completions", entry["protocol"])
+		assert.Empty(t, entry["metadata"], "native protocol support does not prove tool, image or reasoning capabilities")
+	}
+	assert.Equal(t, []string{"chat-about-embeddings", "custom-chat", "glm-5.2", "opaque-alias", "verified-model", "verified-second"}, names)
+	assert.Equal(t, "chat-about-embeddings", catalog.Data["default_model"])
+	assert.Equal(t, catalog.Data["revision"], client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200).Data["revision"])
+	vip := client.request("GET", "/catalog?tool_family=workbuddy&group=vip", nil, 200)
+	assert.Equal(t, "group-isolated", vip.Data["models"].([]any)[0].(map[string]any)["id"], "chat endpoint in another group cannot leak into the selected group")
+	var unchanged model.Channel
+	require.NoError(t, db.First(&unchanged, channelIDs[len(channelIDs)-1]).Error)
+	assert.Equal(t, "invalid-json", unchanged.OtherSettings, "catalog reads must not rewrite malformed channel settings")
+	created := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": "workbuddy", "config_scope": "catalog-test", "group": "default", "models": []string{"glm-5.2"}, "default_model": "glm-5.2", "catalog_revision": catalog.Data["revision"]}, 200)
+	pending := linkConnectionFrom(t, created)
+
+	// A live route disappearing invalidates an unconfirmed selection and cannot
+	// be used by posting a previously displayed model with a fresh revision.
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelIDs[0]).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	current := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	assert.NotEqual(t, catalog.Data["revision"], current.Data["revision"])
+	request := gin.H{"operation_id": uuid.NewString(), "tool_family": "workbuddy", "config_scope": "default", "group": "default", "models": []string{"glm-5.2"}, "default_model": "glm-5.2", "catalog_revision": catalog.Data["revision"]}
+	assert.Equal(t, "LINK_CATALOG_CHANGED", client.request("POST", "/connections", request, 409).Code)
+	request["operation_id"], request["catalog_revision"] = uuid.NewString(), current.Data["revision"]
+	assert.Equal(t, "LINK_INVALID_REQUEST", client.request("POST", "/connections", request, 400).Code)
+	client.request("POST", "/connections/"+pending["id"].(string)+"/actions", gin.H{"operation_id": uuid.NewString(), "action": "commit", "expected_revision": pending["revision"]}, 400)
+	linkAction(t, client, pending, "abort", nil)
+
+	// A broken or unrelated optional file is not a model availability policy.
+	path := filepath.Join(t.TempDir(), "optional.json")
+	t.Setenv("LINK_MODEL_CATALOG_FILE", path)
+	for _, content := range []string{"invalid-json", `{"models":[]}`} {
+		require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+		assert.Equal(t, current.Data["revision"], client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200).Data["revision"])
+	}
+	capabilities := `{"models":[{"id":"verified-model","protocol":"openai_chat_completions","tool_families":["workbuddy"],"groups":["default"],"metadata":{"workbuddy":{"supportsToolCall":false,"supportsImages":"true","supportsReasoning":true,"maxInputTokens":0,"maxOutputTokens":2048}}}]}`
+	require.NoError(t, os.WriteFile(path, []byte(capabilities), 0600))
+	withMetadata := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	assert.NotEqual(t, current.Data["revision"], withMetadata.Data["revision"])
+	for _, item := range withMetadata.Data["models"].([]any) {
+		entry := item.(map[string]any)
+		if entry["id"] == "verified-model" {
+			assert.Equal(t, map[string]any{"workbuddy": map[string]any{"supportsToolCall": false, "supportsReasoning": true, "maxOutputTokens": float64(2048)}}, entry["metadata"])
+		}
+	}
+}
+
 func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, otherUser *linkTestClient) {
 	t.Helper()
+	t.Run("live_routes", func(t *testing.T) { testLinkWorkBuddyLiveCatalog(t, db, client) })
 	catalogPath := filepath.Join(t.TempDir(), "workbuddy-catalog.json")
 	entries := []gin.H{
 		{"id": "verified-second", "protocol": "openai_chat_completions", "tool_families": []string{"workbuddy"}, "groups": []string{"default", "vip"}, "metadata": gin.H{"workbuddy": gin.H{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": 8192}}},
@@ -336,13 +430,13 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	t.Setenv("LINK_MODEL_CATALOG_FILE", catalogPath)
 	catalog := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
 	assert.Equal(t, "workbuddy", catalog.Data["tool_family"])
-	assert.Equal(t, "verified-second", catalog.Data["default_model"])
+	assert.Equal(t, "verified-model", catalog.Data["default_model"])
 	models := catalog.Data["models"].([]any)
 	require.Len(t, models, 2)
 	for _, item := range models {
 		assert.Equal(t, "openai_chat_completions", item.(map[string]any)["protocol"])
 	}
-	assert.Equal(t, map[string]any{"workbuddy": map[string]any{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": float64(8192)}}, models[0].(map[string]any)["metadata"], "verified capability metadata must reach the adapter unchanged")
+	assert.Equal(t, map[string]any{"workbuddy": map[string]any{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": float64(8192)}}, models[1].(map[string]any)["metadata"], "verified capability metadata must reach the adapter unchanged")
 	hermesCatalog := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
 	assert.Len(t, hermesCatalog.Data["models"], 1, "shared protocol does not imply shared tool compatibility")
 	assert.NotEqual(t, catalog.Data["revision"], hermesCatalog.Data["revision"])
@@ -350,7 +444,9 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	invalid, err := common.Marshal(gin.H{"models": entries})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(catalogPath, invalid, 0600))
-	assert.Equal(t, "LINK_CATALOG_UNAVAILABLE", client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 503).Code)
+	invalidMetadata := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	assert.Len(t, invalidMetadata.Data["models"], 2, "bad optional metadata cannot hide a native chat route")
+	assert.Empty(t, invalidMetadata.Data["models"].([]any)[1].(map[string]any)["metadata"])
 	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
 
 	hermesCreated := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": "hermes", "config_scope": "default", "group": "default", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": hermesCatalog.Data["revision"]}, 200)
@@ -455,7 +551,7 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			require.NoError(t, os.WriteFile(catalog, []byte(`{"models":[{"id":"verified-model","protocol":"openai_responses","tool_families":["codex"],"groups":["default","vip"],"price_text":"untrusted static quote","metadata":{"codex":{"slug":"verified-model"}}},{"id":"verified-second","protocol":"openai_responses","tool_families":["codex"],"groups":["default","vip"],"metadata":{"codex":{"slug":"verified-second"}}}]}`), 0600))
 			t.Setenv("LINK_MODEL_CATALOG_FILE", catalog)
 			// Representative pre-extension database with existing account and key, then upgrade twice.
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSession{}, &model.AuthFlow{}, &model.UserAccessToken{}, &model.Ability{}, &model.Log{}, &model.AuditLog{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSession{}, &model.AuthFlow{}, &model.UserAccessToken{}, &model.Ability{}, &model.Channel{}, &model.Log{}, &model.AuditLog{}))
 			suffix := uuid.NewString()[:8]
 			user := &model.User{Username: "link-" + suffix, Password: "unused", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", AffCode: "link-" + suffix}
 			require.NoError(t, db.Create(user).Error)
@@ -477,16 +573,19 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			duplicateToken := existing
 			duplicateToken.Id = 0
 			assert.Error(t, db.Create(&duplicateToken).Error, "native key uniqueness survives extension migrations")
+			channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "link-test-" + suffix, Key: "unused", Status: common.ChannelStatusEnabled}
+			require.NoError(t, db.Create(channel).Error)
 			for _, g := range []string{"default", "vip"} {
 				for _, modelID := range []string{"verified-model", "verified-second"} {
-					require.NoError(t, db.Create(&model.Ability{Group: g, Model: modelID, ChannelId: user.Id, Enabled: true}).Error)
+					require.NoError(t, db.Create(&model.Ability{Group: g, Model: modelID, ChannelId: channel.Id, Enabled: true}).Error)
 				}
 			}
 			t.Cleanup(func() {
 				for _, entity := range []any{&model.LinkSession{}, &model.LinkRefreshUse{}, &model.LinkOperation{}, &model.LinkToolVerification{}, &model.LinkKey{}, &model.LinkConnection{}, &model.Token{}, &model.UserSession{}, &model.UserAccessToken{}} {
 					_ = db.Unscoped().Where("user_id = ?", user.Id).Delete(entity).Error
 				}
-				_ = db.Where("channel_id = ?", user.Id).Delete(&model.Ability{}).Error
+				_ = db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error
+				_ = db.Delete(channel).Error
 				_ = db.Where("user_id = ?", user.Id).Delete(&model.AuthFlow{}).Error
 				_ = db.Unscoped().Delete(user).Error
 			})
@@ -502,7 +601,7 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			device := uuid.NewString()
 			client := linkTestLogin(t, router, user, device)
 			t.Run("current_account_prices", func(t *testing.T) {
-				testLinkLivePrices(t, db, user, client, catalog)
+				testLinkLivePrices(t, db, user, client, catalog, channel.Id)
 			})
 			// Desktop access cannot masquerade as browser or inference credentials.
 			client.request("POST", "/auth/complete", gin.H{"flow_token": "invalid"}, 401)
