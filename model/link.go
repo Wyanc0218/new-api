@@ -50,6 +50,7 @@ type LinkConnection struct {
 	UserID           int    `json:"-" gorm:"not null;index"`
 	DeviceID         string `json:"-" gorm:"type:varchar(36);not null;index"`
 	ToolFamily       string `json:"tool_family" gorm:"type:varchar(32);not null"`
+	ToolProtocol     string `json:"-" gorm:"type:varchar(32);not null;default:''"`
 	ConfigScope      string `json:"config_scope" gorm:"type:varchar(128);not null"`
 	Status           string `json:"status" gorm:"type:varchar(20);not null"`
 	Revision         int64  `json:"revision" gorm:"not null"`
@@ -57,6 +58,24 @@ type LinkConnection struct {
 	CandidateTokenID int    `json:"-"`
 	CreatedAt        int64  `json:"-"`
 	UpdatedAt        int64  `json:"-"`
+}
+
+// Existing native connections predate protocol pinning. Only their immutable
+// built-in definitions may supply a missing protocol; an unknown legacy family
+// must never inherit whatever protocol a new registry entry happens to declare.
+func (connection *LinkConnection) MatchesLinkToolProtocol(tool common.LinkToolDefinition) bool {
+	if connection.ToolFamily != tool.ID {
+		return false
+	}
+	protocol := connection.ToolProtocol
+	if protocol == "" {
+		builtin, ok := common.BuiltinLinkTool(connection.ToolFamily)
+		if !ok {
+			return false
+		}
+		protocol = builtin.Protocol
+	}
+	return protocol == tool.Protocol
 }
 
 type LinkKey struct {
@@ -97,6 +116,7 @@ var (
 	ErrLinkNotFound     = LinkFailure(http.StatusNotFound, "LINK_NOT_FOUND", "Client record not found")
 	ErrLinkState        = LinkFailure(http.StatusConflict, "LINK_STATE_CONFLICT", "Connection state does not permit this action")
 	ErrLinkToken        = LinkFailure(http.StatusConflict, "LINK_TOKEN_UNAVAILABLE", "The platform key is deleted, restricted, expired or unavailable")
+	ErrLinkToolRegistry = LinkFailure(http.StatusServiceUnavailable, "LINK_NOT_CONFIGURED", "Client tool registry is unavailable")
 )
 
 func linkHash(purpose, raw string) string {

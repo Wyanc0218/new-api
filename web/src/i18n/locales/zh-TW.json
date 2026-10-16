@@ -7270,6 +7270,7 @@
     "A browser login session is required": "請先在瀏覽器登入",
     "Browser origin mismatch": "瀏覽器請求來源不符",
     "Client authentication unavailable": "用戶端身分驗證暫不可用",
+    "Client tool registry is unavailable": "用戶端工具清單暫不可用",
     "Client authorization origin is not configured": "尚未設定用戶端授權網站位址",
     "Client authorization requires HTTPS": "用戶端授權需要 HTTPS（加密連線）",
     "Client operation failed": "用戶端操作失敗",

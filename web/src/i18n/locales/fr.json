@@ -7270,6 +7270,7 @@
     "A browser login session is required": "Connectez-vous dans le navigateur",
     "Browser origin mismatch": "L’origine du navigateur ne correspond pas",
     "Client authentication unavailable": "L’authentification du client est indisponible",
+    "Client tool registry is unavailable": "Le registre des outils du client est indisponible",
     "Client authorization origin is not configured": "L’origine d’autorisation du client n’est pas configurée",
     "Client authorization requires HTTPS": "L’autorisation du client nécessite HTTPS",
     "Client operation failed": "L’opération du client a échoué",

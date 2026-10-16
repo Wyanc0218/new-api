@@ -7270,6 +7270,7 @@
     "A browser login session is required": "Vui lòng đăng nhập trong trình duyệt",
     "Browser origin mismatch": "Nguồn yêu cầu của trình duyệt không khớp",
     "Client authentication unavailable": "Hiện không thể xác thực ứng dụng khách",
+    "Client tool registry is unavailable": "Hiện không thể truy cập danh sách công cụ của ứng dụng khách",
     "Client authorization origin is not configured": "Chưa cấu hình địa chỉ trang cấp quyền cho ứng dụng khách",
     "Client authorization requires HTTPS": "Cấp quyền cho ứng dụng khách yêu cầu HTTPS",
     "Client operation failed": "Thao tác của ứng dụng khách thất bại",

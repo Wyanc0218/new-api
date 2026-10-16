@@ -7270,6 +7270,7 @@
     "A browser login session is required": "Сначала войдите в браузере",
     "Browser origin mismatch": "Источник запроса браузера не совпадает",
     "Client authentication unavailable": "Аутентификация клиента недоступна",
+    "Client tool registry is unavailable": "Реестр инструментов клиента недоступен",
     "Client authorization origin is not configured": "Адрес сайта авторизации клиента не настроен",
     "Client authorization requires HTTPS": "Для авторизации клиента требуется HTTPS",
     "Client operation failed": "Операция клиента не выполнена",

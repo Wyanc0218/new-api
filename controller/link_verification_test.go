@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -190,18 +192,18 @@ func testLinkHermesWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, othe
 	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
 	t.Setenv("LINK_MODEL_CATALOG_FILE", catalogPath)
 	catalog := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
-	assert.Equal(t, "verified-second", catalog.Data["default_model"], "platform order determines the initial model")
+	assert.Equal(t, "verified-model", catalog.Data["default_model"], "live model order determines the initial model")
 	models := catalog.Data["models"].([]any)
 	require.Len(t, models, 2)
 	for _, item := range models {
 		assert.Equal(t, "openai_chat_completions", item.(map[string]any)["protocol"])
 	}
-	// A tool-specific protocol error fails closed instead of being accepted by name.
+	// Invalid optional metadata must not hide a live, protocol-compatible route.
 	entries[0]["protocol"] = "openai_responses"
 	invalid, err := common.Marshal(gin.H{"models": entries})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(catalogPath, invalid, 0600))
-	client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 503)
+	assert.Equal(t, catalog.Data["revision"], client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200).Data["revision"])
 	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
 	create := gin.H{"operation_id": uuid.NewString(), "tool_family": "hermes", "config_scope": "default", "group": "default", "models": []string{"verified-model", "verified-second"}, "default_model": "verified-model", "catalog_revision": catalog.Data["revision"]}
 	created := client.request("POST", "/connections", create, 200)
@@ -235,4 +237,121 @@ func testLinkHermesWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, othe
 	assert.Equal(t, "disconnected", conn["status"])
 	assert.NoError(t, db.First(&candidate, candidateID).Error)
 	assert.Equal(t, common.TokenStatusDisabled, candidate.Status)
+	t.Run("configurable_tool_verification", func(t *testing.T) {
+		testLinkConfigurableToolVerification(t, db, client, userID)
+	})
+}
+
+func writeLinkVerificationRegistry(t *testing.T, path string, tools []gin.H) {
+	t.Helper()
+	raw, err := common.Marshal(gin.H{"version": 1, "tools": tools})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, raw, 0600))
+}
+
+func testLinkConfigurableToolVerification(t *testing.T, db *gorm.DB, parent *linkTestClient, userID int) {
+	t.Helper()
+	// Initialize the native token lookup's dialect columns against the fixture's
+	// existing database, without creating another database or running migrations.
+	t.Setenv("LOG_SQL_DSN", "")
+	master := common.IsMasterNode
+	common.IsMasterNode = false
+	err := model.InitLogDB()
+	common.IsMasterNode = master
+	require.NoError(t, err)
+	registryPath := filepath.Join(t.TempDir(), "tools.json")
+	t.Setenv("LINK_TOOL_REGISTRY_FILE", registryPath)
+	for _, tc := range []struct{ name, protocol, path string }{
+		{"chat", "openai_chat_completions", "/v1/chat/completions"},
+		{"messages", "anthropic_messages", "/v1/messages"},
+		{"responses", "openai_responses", "/v1/responses"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := *parent
+			client.t = t
+			family, target := "registered_"+tc.name, "registered-"+tc.name
+			definition := gin.H{"id": family, "protocol": tc.protocol, "verification_targets": []string{target}}
+			writeLinkVerificationRegistry(t, registryPath, []gin.H{definition})
+			catalog := client.request("GET", "/catalog?tool_family="+family+"&group=default", nil, 200)
+			created := client.request("POST", "/connections", gin.H{
+				"operation_id": uuid.NewString(), "tool_family": family, "config_scope": "verification-registry", "group": "default",
+				"models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": catalog.Data["revision"],
+			}, 200)
+			connection := linkConnectionFrom(t, created)
+			connection = linkConnectionFrom(t, linkAction(t, &client, connection, "commit", nil))
+			tokenID := int(created.Data["token_id"].(float64))
+			var persisted model.LinkConnection
+			require.NoError(t, db.First(&persisted, "id = ?", connection["id"]).Error)
+			assert.Equal(t, tc.protocol, persisted.ToolProtocol, "connections preserve their original configured protocol")
+			endpoint := "/connections/" + connection["id"].(string) + "/tool-verifications"
+			body := gin.H{"expected_revision": connection["revision"], "target": target, "model": "verified-model", "protocol": tc.protocol}
+			attempt := client.request("POST", endpoint, body, 200).Data
+			requestID := uuid.NewString()
+			context, _ := gin.CreateTestContext(httptest.NewRecorder())
+			context.Request = httptest.NewRequest("POST", "http://127.0.0.1"+tc.path, nil)
+			context.Set(common.RequestIdKey, requestID)
+			claimed, err := service.ClaimLinkRelayVerification(context, &relaycommon.RelayInfo{IsStream: true, UserId: userID, TokenId: tokenID, OriginModelName: "verified-model"}, attempt["challenge"].(string))
+			require.NoError(t, err)
+			assert.Equal(t, attempt["id"], claimed)
+			require.NoError(t, model.FinishLinkToolVerification(claimed, requestID, true))
+			assert.Equal(t, "succeeded", client.request("GET", "/tool-verifications/"+claimed, nil, 200).Data["status"])
+
+			if tc.name == "chat" {
+				// Registration controls desktop management and verification. Existing
+				// inference keys must remain usable until explicitly paused or disconnected.
+				inference := gin.New()
+				inference.POST(tc.path, middleware.TokenAuth(), func(c *gin.Context) {
+					assert.Equal(t, tokenID, c.GetInt("token_id"))
+					c.Status(http.StatusNoContent)
+				})
+				for _, change := range []struct {
+					name         string
+					tools        []gin.H
+					invalid      bool
+					createStatus int
+				}{
+					{name: "disabled", tools: []gin.H{{"id": family, "enabled": false, "protocol": tc.protocol, "verification_targets": []string{target}}}, createStatus: 400},
+					{name: "removed", tools: []gin.H{}, createStatus: 400},
+					{name: "target reassigned", tools: []gin.H{{"id": family, "protocol": tc.protocol}, {"id": "other_registered", "protocol": tc.protocol, "verification_targets": []string{target}}}, createStatus: 409},
+					{name: "protocol changed", tools: []gin.H{{"id": family, "protocol": "anthropic_messages", "verification_targets": []string{target}}}, createStatus: 400},
+					{name: "invalid configuration", invalid: true, createStatus: 503},
+				} {
+					t.Run(change.name, func(t *testing.T) {
+						changedClient := client
+						changedClient.t = t
+						writeLinkVerificationRegistry(t, registryPath, []gin.H{definition})
+						pending := changedClient.request("POST", endpoint, body, 200).Data
+						if change.invalid {
+							require.NoError(t, os.WriteFile(registryPath, []byte(`{"version":1,"tools":`), 0600))
+						} else {
+							writeLinkVerificationRegistry(t, registryPath, change.tools)
+						}
+						changedClient.request("POST", endpoint, body, change.createStatus)
+						_, err := model.ClaimLinkToolVerification(pending["challenge"].(string), userID, tokenID, "verified-model", tc.protocol, uuid.NewString())
+						require.Error(t, err)
+						if change.invalid {
+							changedClient.request("GET", "/tool-verifications/"+pending["id"].(string), nil, 503)
+						} else {
+							assert.Equal(t, "failed", changedClient.request("GET", "/tool-verifications/"+pending["id"].(string), nil, 200).Data["status"])
+							assert.Equal(t, "failed", changedClient.request("GET", "/tool-verifications/"+claimed, nil, 200).Data["status"], "a prior receipt cannot attest a different current tool definition")
+						}
+						if change.name == "protocol changed" {
+							changedClient.request("POST", endpoint, gin.H{"expected_revision": connection["revision"], "target": target, "model": "verified-model", "protocol": "anthropic_messages"}, 409)
+						}
+						request := httptest.NewRequest("POST", "http://127.0.0.1"+tc.path, nil)
+						request.Header.Set("Authorization", "Bearer "+created.Data["api_key"].(string))
+						response := httptest.NewRecorder()
+						inference.ServeHTTP(response, request)
+						assert.Equal(t, http.StatusNoContent, response.Code, "tool registration must not revoke ordinary inference authorization")
+						var stored model.LinkToolVerification
+						require.NoError(t, db.First(&stored, "id = ?", claimed).Error)
+						assert.Equal(t, "succeeded", stored.Status, "definition changes must not rewrite historical completion records")
+					})
+				}
+			}
+			writeLinkVerificationRegistry(t, registryPath, []gin.H{definition})
+			connection = linkConnectionFrom(t, linkAction(t, &client, connection, "disconnect", nil))
+			assert.Equal(t, "disconnected", connection["status"])
+		})
+	}
 }

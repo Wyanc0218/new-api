@@ -7270,6 +7270,7 @@
     "A browser login session is required": "先にブラウザーでログインしてください",
     "Browser origin mismatch": "ブラウザーのリクエスト元が一致しません",
     "Client authentication unavailable": "クライアント認証を利用できません",
+    "Client tool registry is unavailable": "クライアントのツール一覧を利用できません",
     "Client authorization origin is not configured": "クライアント認可のサイトアドレスが未設定です",
     "Client authorization requires HTTPS": "クライアント認可には HTTPS が必要です",
     "Client operation failed": "クライアント操作に失敗しました",

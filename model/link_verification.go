@@ -46,19 +46,16 @@ type LinkToolChallenge struct {
 var ErrLinkVerification = LinkFailure(409, "LINK_VERIFICATION_REJECTED", "Tool verification is expired, already used or does not match the active connection")
 
 func CreateLinkToolVerification(session *LinkSession, connectionID string, r LinkToolVerificationRequest) (*LinkToolChallenge, error) {
-	family := ""
-	switch {
-	case r.Target == "codex-cli" && r.Protocol == "openai_responses":
-		family = "codex"
-	case r.Target == "claude-code" && r.Protocol == "anthropic_messages":
-		family = "claude_code"
-	case r.Target == "hermes" && r.Protocol == "openai_chat_completions":
-		family = "hermes"
-	default:
-		return nil, LinkFailure(400, "LINK_INVALID_REQUEST", "Unsupported verification target or protocol")
-	}
 	if session == nil || len(r.Model) == 0 || len(r.Model) > 255 || r.ExpectedRevision < 1 {
 		return nil, LinkFailure(400, "LINK_INVALID_REQUEST", "Invalid verification request")
+	}
+	registry, err := common.LoadLinkToolRegistry()
+	if err != nil {
+		return nil, ErrLinkToolRegistry
+	}
+	tool, enabled := registry.VerificationTool(r.Target, r.Protocol)
+	if !enabled {
+		return nil, LinkFailure(400, "LINK_INVALID_REQUEST", "Unsupported verification target or protocol")
 	}
 	secret, err := LinkRandomSecret("link_v_")
 	if err != nil {
@@ -86,7 +83,7 @@ func CreateLinkToolVerification(session *LinkSession, connectionID string, r Lin
 			}
 			return err
 		}
-		if connection.Revision != r.ExpectedRevision || connection.ToolFamily != family || connection.Status != "active" || connection.CandidateTokenID != 0 {
+		if connection.Revision != r.ExpectedRevision || !connection.MatchesLinkToolProtocol(tool) || connection.Status != "active" || connection.CandidateTokenID != 0 {
 			return ErrLinkState
 		}
 		_, key, err := validateLinkKey(tx, &connection, connection.ActiveTokenID, true, true)
@@ -119,8 +116,12 @@ func ClaimLinkToolVerification(challenge string, userID, tokenID int, modelID, p
 	if len(challenge) != 50 || len(requestID) == 0 || len(requestID) > 64 {
 		return "", ErrLinkVerification
 	}
+	registry, err := common.LoadLinkToolRegistry()
+	if err != nil {
+		return "", ErrLinkToolRegistry
+	}
 	var verification LinkToolVerification
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.Transaction(func(tx *gorm.DB) error {
 		// Follow the same account -> connection lock order as connection mutations.
 		claim := tx.Model(&User{}).Where("id = ? AND status = ?", userID, common.UserStatusEnabled).UpdateColumn("auth_version", gorm.Expr("auth_version"))
 		if claim.Error != nil {
@@ -139,6 +140,10 @@ func ClaimLinkToolVerification(challenge string, userID, tokenID int, modelID, p
 		}
 		var connection LinkConnection
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND device_id = ? AND revision = ? AND active_token_id = ? AND status = ? AND candidate_token_id = 0", verification.ConnectionID, userID, verification.DeviceID, verification.ConnectionRevision, tokenID, "active").First(&connection).Error; err != nil {
+			return ErrLinkVerification
+		}
+		tool, enabled := registry.VerificationTool(verification.Target, verification.Protocol)
+		if !enabled || !connection.MatchesLinkToolProtocol(tool) {
 			return ErrLinkVerification
 		}
 		if _, _, err := validateLinkKey(tx, &connection, tokenID, true, true); err != nil {
@@ -172,8 +177,16 @@ func GetLinkToolVerification(session *LinkSession, id string) (*LinkToolVerifica
 		}
 		return nil, err
 	}
+	registry, err := common.LoadLinkToolRegistry()
+	if err != nil {
+		return nil, ErrLinkToolRegistry
+	}
 	var connection LinkConnection
-	if err := DB.Where("id = ? AND revision = ? AND active_token_id = ? AND status = ? AND candidate_token_id = 0", verification.ConnectionID, verification.ConnectionRevision, verification.TokenID, "active").First(&connection).Error; err != nil {
+	if err := DB.Where("id = ? AND user_id = ? AND device_id = ? AND revision = ? AND active_token_id = ? AND status = ? AND candidate_token_id = 0", verification.ConnectionID, session.UserID, session.DeviceID, verification.ConnectionRevision, verification.TokenID, "active").First(&connection).Error; err != nil {
+		verification.Status = "failed"
+	}
+	tool, enabled := registry.VerificationTool(verification.Target, verification.Protocol)
+	if !enabled || !connection.MatchesLinkToolProtocol(tool) {
 		verification.Status = "failed"
 	}
 	if verification.ExpiresAt <= time.Now().Unix() && verification.Status == "pending" {

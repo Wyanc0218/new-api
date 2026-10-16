@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/google/uuid"
@@ -204,25 +205,31 @@ type LinkCatalog struct {
 	DefaultModel string             `json:"default_model"`
 }
 
-func ValidLinkTool(tool string) bool {
-	return tool == "codex" || tool == "claude_code" || tool == "claude_desktop" || tool == "hermes" || tool == "workbuddy"
-}
 func GetLinkCatalog(userID int, tool, group string) (*LinkCatalog, error) {
 	user, err := model.GetSelfUserById(userID)
 	if err != nil {
 		return nil, err
 	}
-	return linkCatalogForUser(model.DB, user, tool, group)
+	registry, err := common.LoadLinkToolRegistry()
+	if err != nil {
+		return nil, model.ErrLinkToolRegistry
+	}
+	definition, enabled := registry.Tool(tool)
+	if !enabled {
+		return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
+	}
+	return linkCatalogForUser(model.DB, user, definition, group)
 }
-func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*LinkCatalog, error) {
-	if !ValidLinkTool(tool) || group == "" || group == "auto" || len(group) > 64 {
+func linkCatalogForUser(tx *gorm.DB, user *model.User, definition common.LinkToolDefinition, group string) (*LinkCatalog, error) {
+	tool := definition.ID
+	if group == "" || group == "auto" || len(group) > 64 {
 		return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
 	}
 	if !IsUserSelectableGroup(user.Group, group) {
 		return nil, model.LinkFailure(403, "LINK_FORBIDDEN", "Price group is not available to this account")
 	}
-	if tool == "workbuddy" {
-		return linkWorkBuddyCatalog(tx, user, group)
+	if definition.Profile != common.LinkProfileCodex {
+		return linkLiveCatalog(tx, user, definition, group)
 	}
 	file, err := os.Open(os.Getenv("LINK_MODEL_CATALOG_FILE"))
 	if err != nil {
@@ -245,13 +252,7 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 		return nil, err
 	}
 	result := &LinkCatalog{ToolFamily: tool, Group: group, Models: []LinkCatalogEntry{}}
-	protocol := "anthropic_messages"
-	switch tool {
-	case "codex":
-		protocol = "openai_responses"
-	case "hermes", "workbuddy":
-		protocol = "openai_chat_completions"
-	}
+	protocol := definition.Protocol
 	seen := map[string]bool{}
 	for _, entry := range configured.Models {
 		if !slices.Contains(entry.ToolFamilies, tool) || !slices.Contains(entry.Groups, group) {
@@ -286,15 +287,42 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 		Raw         string
 		Tool, Group string
 		Models      []LinkCatalogEntry
-	}{string(raw), tool, group, result.Models})
+		Definition  common.LinkToolDefinition
+	}{string(raw), tool, group, result.Models, definition})
 	sum := sha256.Sum256(material)
 	result.Revision = hex.EncodeToString(sum[:])
 	return result, nil
 }
 
-// WorkBuddy accepts custom OpenAI chat models. Its availability must follow the
-// platform's live routes, not a second, manually maintained model allowlist.
-func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCatalog, error) {
+// Exact Claude Desktop 2.19675.0 gateway name filter. Family metadata is optional;
+// these names are rejected by the native client even when discovery is disabled.
+var linkClaudeDesktopOtherModels = regexp.MustCompile(`ark-code|astron|command-r|deepseek|doubao|gemini|gemma|glm|gpt|grok|hermes|hy3|kimi|lfm|\bling\b|llama|longcat|mimo|minimax|mistral|mixtral|moonshot|nemotron|openai|phi-|qianfan|qwen|tc-code|\bunic\b|yi-|stepfun|step-3|seed-|bytedance|hunyuan|granite|amazon\.nova|nova-|devstral|ministral|ernie|codex|arcee|trinity|abab|phi\d|\bk2\.|\bm2\.|jamba|arctic|solar|mercury|zamba|kat-coder|\bds-|dpsk`)
+
+func linkClaudeDesktopModel(name string) bool {
+	// Native schema/normalization trims IDs and strips the optional 1M shorthand.
+	// A fixed platform model ID must survive unchanged, without inferred capability.
+	if name != strings.TrimSpace(name) || strings.HasSuffix(strings.ToLower(name), "[1m]") {
+		return false
+	}
+	name = strings.ToLower(name)
+	families := []string{"sonnet", "opus", "haiku", "fable", "mythos"}
+	if slices.Contains(families, name) || linkClaudeDesktopOtherModels.MatchString(name) {
+		return false
+	}
+	return strings.Contains(name, "claude") || strings.Contains(name, "anthropic") || slices.ContainsFunc(families, func(family string) bool { return strings.Contains(name, family) })
+}
+
+// Model availability follows current routes. Optional compatibility metadata can
+// enrich a model but must not hide a newly enabled route behind a second allowlist.
+func linkLiveCatalog(tx *gorm.DB, user *model.User, definition common.LinkToolDefinition, group string) (*LinkCatalog, error) {
+	tool, protocol := definition.ID, definition.Protocol
+	requestPath := "/v1/chat/completions"
+	switch protocol {
+	case common.LinkProtocolMessages:
+		requestPath = "/v1/messages"
+	case common.LinkProtocolResponses:
+		requestPath = "/v1/responses"
+	}
 	var abilities []model.Ability
 	if err := tx.Where(&model.Ability{Group: group, Enabled: true}).Find(&abilities).Error; err != nil {
 		return nil, err
@@ -311,7 +339,7 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 	if len(channelIDs) > 0 {
 		// Do not load upstream credentials or use GetOtherSettings, whose invalid
 		// JSON recovery can write the channel outside this transaction.
-		if err := tx.Select("id", "type", "settings").Where("id IN ? AND status = ?", channelIDs, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+		if err := tx.Select("id", "type", "settings", "setting", "model_mapping").Where("id IN ? AND status = ?", channelIDs, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -320,18 +348,21 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 		byID[channel.Id] = channel
 	}
 	available := make(map[string]bool)
+	blocked := make(map[string]bool)
 	for _, ability := range abilities {
 		channel, enabled := byID[ability.ChannelId]
 		if !enabled || ability.Model == "" || len(ability.Model) > 255 {
 			continue
 		}
 		endpoints := common.GetEndpointTypesByChannelType(channel.Type, ability.Model)
+		var advanced *dto.AdvancedCustomConfig
 		if channel.Type == constant.ChannelTypeAdvancedCustom {
 			var settings dto.ChannelOtherSettings
 			if common.UnmarshalJsonStr(channel.OtherSettings, &settings) != nil || settings.AdvancedCustom == nil {
 				continue
 			}
 			endpoints = settings.AdvancedCustom.SupportedEndpointTypesForModel(ability.Model)
+			advanced = settings.AdvancedCustom
 		} else {
 			// Generic OpenAI channel capabilities include chat even for known
 			// non-chat models. Follow the platform's image classification and
@@ -339,15 +370,121 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 			// above remain authoritative; unfamiliar aliases are not guessed.
 			name := strings.ToLower(ability.Model)
 			if common.IsImageGenerationModel(name) || strings.Contains(name, "rerank") || strings.Contains(name, "embed") || strings.HasPrefix(name, "m3e") || strings.Contains(name, "bge-") || channel.Type == constant.ChannelTypeMokaAI {
+				blocked[ability.Model] = true
 				continue
 			}
+			if constant.IsAdvancedCustomChannel(channel.Type) {
+				advanced = common.GetAdvancedCustomPreset(channel.Type)
+			}
 		}
-		if slices.Contains(endpoints, constant.EndpointTypeOpenAI) {
+		if definition.Profile == common.LinkProfileClaudeDesktop && !linkClaudeDesktopModel(ability.Model) {
+			continue
+		}
+		supported := slices.Contains(endpoints, constant.EndpointTypeOpenAI)
+		var setting dto.ChannelSettings
+		if channel.Setting != nil && *channel.Setting != "" && common.UnmarshalJsonStr(*channel.Setting, &setting) != nil {
+			blocked[ability.Model] = true
+			continue
+		}
+		passThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled || setting.PassThroughBodyEnabled
+		apiType, known := common.ChannelType2APIType(channel.Type)
+		if !known && (channel.Type == constant.ChannelTypeAzure || channel.Type == constant.ChannelTypeCustom) {
+			known = true
+		}
+		if advanced != nil {
+			// The router excludes advanced routes with no matching incoming path.
+			// Check the first matching route, just as the actual adaptor does.
+			route, matched := advanced.MatchPathForModel(requestPath, ability.Model)
+			if !matched {
+				continue
+			}
+			if advanced.Validate() != nil {
+				blocked[ability.Model] = true
+				continue
+			}
+			supported = !(passThrough || route.PassThroughBodyEnabled) || route.SupportsPassThroughBody()
+		} else if protocol == common.LinkProtocolResponses {
+			// Endpoint lists describe preferred presentation, not the adaptor's
+			// request/response conversion contract. These implementations handle
+			// native responses bodies and responses streams without conversion.
+			supported = known && slices.Contains([]int{
+				constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+				constant.APITypeNewAPI, constant.APITypeSub2API, constant.APITypeAli,
+				constant.APITypeZhipuV4, constant.APITypeOllama, constant.APITypePerplexity,
+				constant.APITypeDeepSeek, constant.APITypeVolcEngine, constant.APITypeXai,
+				constant.APITypeCloudflare,
+			}, apiType)
+			if !passThrough && known && slices.Contains([]int{constant.APITypeAnthropic, constant.APITypeGemini, constant.APITypeCodex}, apiType) {
+				// Anthropic/Gemini convert both directions. The Codex channel
+				// requires normalized responses fields even though its body shape
+				// is otherwise native; raw passthrough skips those requirements.
+				supported = true
+			}
+		} else if protocol == common.LinkProtocolMessages {
+			// These adaptors route Claude bodies to a native messages endpoint;
+			// they do not require chat/envelope conversion even with passthrough.
+			supported = known && slices.Contains([]int{
+				constant.APITypeAnthropic, constant.APITypeNewAPI, constant.APITypeSub2API,
+				constant.APITypeDeepSeek, constant.APITypeMoonshot, constant.APITypeMiniMax,
+				constant.APITypeZhipuV4, constant.APITypeOllama,
+			}, apiType)
+			if !supported && !passThrough && known && (slices.Contains(endpoints, constant.EndpointTypeOpenAI) || slices.Contains(endpoints, constant.EndpointTypeAnthropic)) {
+				// Preferred endpoint lists are not a conversion capability matrix.
+				// These adaptors implement ConvertClaudeRequest; OpenAI converts
+				// messages to chat by default without a per-model switch.
+				switch apiType {
+				case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+					constant.APITypeGemini, constant.APITypeAli, constant.APITypeZhipuV4,
+					constant.APITypeOllama, constant.APITypePerplexity, constant.APITypeSiliconFlow,
+					constant.APITypeDeepSeek, constant.APITypeVolcEngine,
+					constant.APITypeBaiduV2, constant.APITypeMoonshot, constant.APITypeMiniMax:
+					supported = true
+				case constant.APITypeAws, constant.APITypeVertexAi:
+					// These adaptors dispatch other upstream models to Nova/Gemini
+					// while ConvertClaudeRequest always produces a Claude body.
+					// Do not infer the dispatch target across model-mapping chains.
+					unmapped := channel.ModelMapping == nil || strings.TrimSpace(*channel.ModelMapping) == "" || strings.TrimSpace(*channel.ModelMapping) == "{}"
+					supported = unmapped && strings.HasPrefix(ability.Model, "claude")
+					if apiType == constant.APITypeAws && unmapped {
+						supported = supported || strings.HasPrefix(ability.Model, "anthropic.claude") || strings.Contains(ability.Model, ".anthropic.claude")
+					}
+				}
+			}
+		} else {
+			supported = supported && known
+			if passThrough {
+				// These adaptors use native OpenAI chat bodies at their chat endpoint.
+				// Field normalization is distinct from conversion into Claude/Gemini
+				// or AWS/Vertex envelopes, which raw-body passthrough cannot supply.
+				nativeChat := slices.Contains([]int{
+					constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+					constant.APITypeNewAPI, constant.APITypeSub2API, constant.APITypeAli,
+					constant.APITypeZhipuV4, constant.APITypePerplexity, constant.APITypeSiliconFlow,
+					constant.APITypeMistral, constant.APITypeDeepSeek, constant.APITypeVolcEngine,
+					constant.APITypeBaiduV2, constant.APITypeXai, constant.APITypeMoonshot,
+					constant.APITypeSubmodel, constant.APITypeMiniMax, constant.APITypeCloudflare,
+				}, apiType)
+				if apiType == constant.APITypeOllama {
+					var settings dto.ChannelOtherSettings
+					nativeChat = common.UnmarshalJsonStr(channel.OtherSettings, &settings) == nil && settings.OllamaOpenAIChat
+				}
+				supported = supported && nativeChat
+			}
+		}
+		if !supported {
+			// Ordinary channels are not filtered by request path at selection.
+			// One working route cannot hide another randomly selectable failure.
+			blocked[ability.Model] = true
+		}
+		if supported {
 			available[ability.Model] = true
 		}
 	}
+	for name := range blocked {
+		delete(available, name)
+	}
 	if len(available) == 0 {
-		return nil, model.LinkFailure(409, "LINK_NO_MODELS", "No chat completion model is currently available in this price group")
+		return nil, model.LinkFailure(409, "LINK_NO_MODELS", "No compatible model is currently available for this tool and price group")
 	}
 
 	// An optional compatibility file enriches capabilities only. Missing, invalid
@@ -362,7 +499,7 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 		if readErr == nil && len(raw) <= 1024*1024 && common.Unmarshal(raw, &configured) == nil {
 			seen := make(map[string]bool)
 			for _, entry := range configured.Models {
-				if !available[entry.ID] || !slices.Contains(entry.ToolFamilies, "workbuddy") || !slices.Contains(entry.Groups, group) {
+				if !available[entry.ID] || !slices.Contains(entry.ToolFamilies, tool) || !slices.Contains(entry.Groups, group) {
 					continue
 				}
 				if seen[entry.ID] {
@@ -370,7 +507,11 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 					continue
 				}
 				seen[entry.ID] = true
-				if entry.Protocol != "openai_chat_completions" {
+				if entry.Protocol != protocol {
+					continue
+				}
+				if definition.Profile != common.LinkProfileWorkBuddy {
+					metadata[entry.ID] = entry.Metadata
 					continue
 				}
 				capabilities, ok := entry.Metadata["workbuddy"].(map[string]any)
@@ -399,15 +540,22 @@ func linkWorkBuddyCatalog(tx *gorm.DB, user *model.User, group string) (*LinkCat
 		names = append(names, name)
 	}
 	slices.Sort(names)
-	result := &LinkCatalog{ToolFamily: "workbuddy", Group: group, Models: []LinkCatalogEntry{}, DefaultModel: names[0]}
+	result := &LinkCatalog{ToolFamily: tool, Group: group, Models: []LinkCatalogEntry{}, DefaultModel: names[0]}
 	for _, name := range names {
-		entry := LinkCatalogEntry{ID: name, Label: name, Protocol: "openai_chat_completions", Metadata: map[string]any{}, PriceText: linkModelPriceText(user.Group, group, name)}
+		entry := LinkCatalogEntry{ID: name, Label: name, Protocol: protocol, Metadata: map[string]any{}, PriceText: linkModelPriceText(user.Group, group, name)}
 		if capabilities := metadata[name]; capabilities != nil {
-			entry.Metadata["workbuddy"] = capabilities
+			if definition.Profile == common.LinkProfileWorkBuddy {
+				entry.Metadata["workbuddy"] = capabilities
+			} else {
+				entry.Metadata = capabilities
+			}
 		}
 		result.Models = append(result.Models, entry)
 	}
-	material, _ := common.Marshal(result)
+	material, _ := common.Marshal(struct {
+		Catalog    *LinkCatalog
+		Definition common.LinkToolDefinition
+	}{result, definition})
 	sum := sha256.Sum256(material)
 	result.Revision = hex.EncodeToString(sum[:])
 	return result, nil
@@ -492,7 +640,7 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 		if r.ConfigScope == "" {
 			r.ConfigScope = "default"
 		}
-		if !ValidLinkTool(r.ToolFamily) || !linkScopePattern.MatchString(r.ConfigScope) {
+		if !common.ValidLinkToolID(r.ToolFamily) || !linkScopePattern.MatchString(r.ConfigScope) {
 			return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Invalid tool or configuration scope")
 		}
 	}
@@ -505,8 +653,19 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 	if result, err := model.RetryLinkOperation(session, id, r); result != nil || err != nil {
 		return result, err
 	}
+	// Completed idempotent results and cleanup actions remain available even
+	// after a tool is disabled or the administrator's registry file is invalid.
+	admit := slices.Contains([]string{"create", "prepare_switch", "update_models", "commit", "resume"}, r.Action)
+	var registry *common.LinkToolRegistry
+	if admit {
+		var err error
+		registry, err = common.LoadLinkToolRegistry()
+		if err != nil {
+			return nil, model.ErrLinkToolRegistry
+		}
+	}
 	validate := func(tx *gorm.DB, user *model.User, conn *model.LinkConnection) error {
-		if r.Action != "create" && r.Action != "prepare_switch" && r.Action != "update_models" && r.Action != "commit" && r.Action != "resume" {
+		if !admit {
 			return nil
 		}
 		tool, group := r.ToolFamily, r.Group
@@ -531,7 +690,18 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 				}
 			}
 		}
-		catalog, err := linkCatalogForUser(tx, user, tool, group)
+		definition, enabled := registry.Tool(tool)
+		if !enabled {
+			return model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
+		}
+		if conn.Revision == 0 && r.Action == "create" {
+			conn.ToolProtocol = definition.Protocol
+		} else if !conn.MatchesLinkToolProtocol(definition) {
+			return model.ErrLinkState
+		} else if conn.ToolProtocol == "" {
+			conn.ToolProtocol = definition.Protocol
+		}
+		catalog, err := linkCatalogForUser(tx, user, definition, group)
 		if err != nil {
 			return err
 		}
