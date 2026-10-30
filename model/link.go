@@ -578,7 +578,13 @@ func createLinkCandidate(tx *gorm.DB, conn *LinkConnection, r LinkActionRequest)
 		return 0, err
 	}
 	now := time.Now().Unix()
-	token := Token{UserId: conn.UserID, Key: secret, Status: common.TokenStatusEnabled, Name: "Link " + conn.ToolFamily + " " + uuid.NewString()[:8], CreatedTime: now, AccessedTime: now, ExpiredTime: -1, UnlimitedQuota: true, Group: r.Group}
+	token := Token{
+		UserId: conn.UserID, Key: secret, Status: common.TokenStatusEnabled,
+		Name: "Link " + conn.ToolFamily + " " + uuid.NewString()[:8], CreatedTime: now, AccessedTime: now,
+		ExpiredTime: -1, UnlimitedQuota: true, Group: r.Group,
+		// Match the native creation default without changing existing keys.
+		AllowUserQuotaQuery: true,
+	}
 	if err := tx.Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).Create(&token).Error; err != nil {
 		return 0, err
 	}

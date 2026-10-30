@@ -466,6 +466,12 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 		{"native-chat-i", "default", "", "", constant.ChannelTypeSiliconFlow, common.ChannelStatusEnabled, true, false, true},
 		{"native-chat-j", "default", "", `{"ollama_openai_chat":true}`, constant.ChannelTypeOllama, common.ChannelStatusEnabled, true, false, true},
 		{"claude-invalid-converter", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekSearchModel, "default", "", "", constant.ChannelTypeDeepSeek, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekFetchModel, "default", "", "", constant.ChannelTypeDeepSeek, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekSearchModel, "default", "", "", constant.ChannelTypeNewAPI, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekFetchModel, "default", "", "", constant.ChannelTypeNewAPI, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekSearchModel, "vip", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/messages"},{"incoming_path":"/v1/chat/completions","upstream_path":"/chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
+		{constant.DeepSeekFetchModel, "vip", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/messages"},{"incoming_path":"/v1/chat/completions","upstream_path":"/chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
 	}
 	var channelIDs []int
 	t.Cleanup(func() {
@@ -535,6 +541,8 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 		for _, item := range catalog.Data["models"].([]any) {
 			names = append(names, item.(map[string]any)["id"].(string))
 		}
+		assert.NotContains(t, names, constant.DeepSeekSearchModel)
+		assert.NotContains(t, names, constant.DeepSeekFetchModel)
 		if tool == "hermes" || tool == "workbuddy" {
 			assert.Contains(t, names, "claude-opus-4-8", "native chat routes remain usable with global passthrough")
 			assert.NotContains(t, names, "claude-native-passthrough", "chat requests still require conversion for an Anthropic channel")
@@ -553,6 +561,15 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 			assert.Contains(t, names, "claude-native-e")
 			assert.Contains(t, names, "claude-native-f")
 		}
+	}
+	for _, tool := range []string{"hermes", "workbuddy", "claude_code"} {
+		catalog := client.request("GET", "/catalog?tool_family="+tool+"&group=vip", nil, 200)
+		var names []string
+		for _, item := range catalog.Data["models"].([]any) {
+			names = append(names, item.(map[string]any)["id"].(string))
+		}
+		assert.Contains(t, names, constant.DeepSeekSearchModel, "an explicit generation route can serve this alias in another group")
+		assert.Contains(t, names, constant.DeepSeekFetchModel)
 	}
 }
 
@@ -602,6 +619,11 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	assert.NotEqual(t, hermesConn["id"], conn["id"], "same device and config scope must keep independent tool connections")
 	assert.NotEqual(t, hermesCreated.Data["token_id"], created.Data["token_id"])
 	tokenID := int(created.Data["token_id"].(float64))
+	var original, candidate model.Token
+	require.NoError(t, db.First(&original, tokenID).Error)
+	assert.True(t, original.AllowUserQuotaQuery, "new desktop keys follow the native key creation default")
+	// A later website restriction must survive pause/resume, switching and retirement.
+	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", tokenID).Update("allow_user_quota_query", false).Error)
 	endpoint := "/connections/" + conn["id"].(string)
 	for _, unauthorized := range []*linkTestClient{otherDevice, otherUser} {
 		unauthorized.request("GET", endpoint, nil, 404)
@@ -615,12 +637,13 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	assert.Equal(t, "paused", conn["status"])
 	conn = linkConnectionFrom(t, linkAction(t, client, conn, "resume", nil))
 	assert.Equal(t, "active", conn["status"])
+	require.NoError(t, db.First(&original, tokenID).Error)
+	assert.False(t, original.AllowUserQuotaQuery, "pause/resume must not reset an existing key's privacy setting")
 	vip := client.request("GET", "/catalog?tool_family=workbuddy&group=vip", nil, 200)
 	prepared := linkAction(t, client, conn, "prepare_switch", gin.H{"group": "vip", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": vip.Data["revision"]})
 	conn = linkConnectionFrom(t, prepared)
 	candidateID := int(prepared.Data["token_id"].(float64))
 	assert.NotEqual(t, tokenID, candidateID)
-	var original, candidate model.Token
 	require.NoError(t, db.First(&original, tokenID).Error)
 	assert.Equal(t, common.TokenStatusEnabled, original.Status, "old key remains usable until switch commits")
 	conn = linkConnectionFrom(t, linkAction(t, client, conn, "commit", nil))
@@ -628,15 +651,18 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	require.NoError(t, db.First(&candidate, candidateID).Error)
 	assert.Equal(t, "default", original.Group)
 	assert.Equal(t, common.TokenStatusDisabled, original.Status)
+	assert.False(t, original.AllowUserQuotaQuery)
 	assert.Equal(t, "vip", candidate.Group)
 	assert.Equal(t, common.TokenStatusEnabled, candidate.Status)
 	assert.True(t, candidate.UnlimitedQuota)
+	assert.True(t, candidate.AllowUserQuotaQuery, "switching creates independent native defaults instead of copying old key restrictions")
 	assert.Equal(t, int64(-1), candidate.ExpiredTime)
 	assert.False(t, candidate.ModelLimitsEnabled)
 	conn = linkConnectionFrom(t, linkAction(t, client, conn, "disconnect", nil))
 	assert.Equal(t, "disconnected", conn["status"])
 	require.NoError(t, db.First(&candidate, candidateID).Error)
 	assert.Equal(t, common.TokenStatusDisabled, candidate.Status)
+	assert.True(t, candidate.AllowUserQuotaQuery, "disconnect changes status only")
 	var hermesToken model.Token
 	require.NoError(t, db.First(&hermesToken, int(hermesCreated.Data["token_id"].(float64))).Error)
 	assert.Equal(t, common.TokenStatusEnabled, hermesToken.Status, "WorkBuddy lifecycle cannot disable another tool's key")
@@ -735,6 +761,12 @@ func testLinkRegisteredResponsesCatalog(t *testing.T, db *gorm.DB, client *linkT
 		{"responses-unmatched-invalid", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":""}]}}`, constant.ChannelTypeAdvancedCustom, true, true},
 		{"responses-matched-invalid", "default", "", "", constant.ChannelTypeOpenAI, false, false},
 		{"responses-matched-invalid", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":""}]}}`, constant.ChannelTypeAdvancedCustom, false, false},
+		{constant.DeepSeekSearchModel, "default", "", "", constant.ChannelTypeDeepSeek, false, false},
+		{constant.DeepSeekFetchModel, "default", "", "", constant.ChannelTypeDeepSeek, false, false},
+		{constant.DeepSeekSearchModel, "default", "", "", constant.ChannelTypeNewAPI, false, false},
+		{constant.DeepSeekFetchModel, "default", "", "", constant.ChannelTypeNewAPI, false, false},
+		{constant.DeepSeekSearchModel, "vip", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":"/responses"}]}}`, constant.ChannelTypeAdvancedCustom, false, false},
+		{constant.DeepSeekFetchModel, "vip", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":"/responses"}]}}`, constant.ChannelTypeAdvancedCustom, false, false},
 	}
 	var ids []int
 	t.Cleanup(func() {
@@ -766,6 +798,13 @@ func testLinkRegisteredResponsesCatalog(t *testing.T, db *gorm.DB, client *linkT
 			}
 			assert.Equal(t, want, names[tc.name], "%s global pass-through=%v", tc.name, globalPass)
 		}
+		vip := client.request("GET", "/catalog?tool_family=responses_agent&group=vip", nil, 200)
+		var aliases []string
+		for _, raw := range vip.Data["models"].([]any) {
+			aliases = append(aliases, raw.(map[string]any)["id"].(string))
+		}
+		assert.Contains(t, aliases, constant.DeepSeekSearchModel, "explicit advanced response routes remain authoritative")
+		assert.Contains(t, aliases, constant.DeepSeekFetchModel)
 	}
 }
 
@@ -930,6 +969,7 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			assert.Equal(t, existing.Group, preserved.Group)
 			assert.Equal(t, existing.RemainQuota, preserved.RemainQuota)
 			assert.Equal(t, existing.CrossGroupRetry, preserved.CrossGroupRetry)
+			assert.False(t, preserved.AllowUserQuotaQuery, "migrations must not enable account quota queries on an existing key")
 			assert.True(t, db.Migrator().HasIndex(&model.Token{}, "Key"))
 			duplicateToken := existing
 			duplicateToken.Id = 0
