@@ -364,6 +364,13 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, definition common.LinkToolDe
 			endpoints = settings.AdvancedCustom.SupportedEndpointTypesForModel(ability.Model)
 			advanced = settings.AdvancedCustom
 		} else {
+			// Dedicated Search/Fetch routing names are not generation models,
+			// even when the channel adaptor also implements Messages/Responses.
+			// Explicit advanced routes above remain authoritative for aliases.
+			if len(endpoints) == 1 && (endpoints[0] == constant.EndpointTypeDeepSeekToolsSearch || endpoints[0] == constant.EndpointTypeDeepSeekToolsFetch) {
+				blocked[ability.Model] = true
+				continue
+			}
 			// Generic OpenAI channel capabilities include chat even for known
 			// non-chat models. Follow the platform's image classification and
 			// controller/channel-test.go task detection. Explicit custom routes
